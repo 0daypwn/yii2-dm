@@ -2,6 +2,7 @@
     "name": "myy/yii2-dm",
     "description": "yii2 dm driver, base on yii2 oci driver.",
     "type": "library",
+    "license": "BSD-3-Clause",
     "require": {
         "php": ">=5.6.0",
         "yiisoft/yii2": "~2.0.14"
