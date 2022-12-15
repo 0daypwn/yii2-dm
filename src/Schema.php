@@ -152,7 +152,7 @@ SQL;
         $table = new TableSchema();
         $this->resolveTableNames($table, $name);
         if ($this->findColumns($table)) {
-            $this->findConstraints($table);
+            $this->findConstraints($table); // 查找约束
             return $table;
         }
 
@@ -337,15 +337,58 @@ SQL;
             return false;
         }
 
+        $autoIncrementColumnsSet = $this->findAutoIncrementColumns($table);
         foreach ($columns as $column) {
             if ($this->db->slavePdo->getAttribute(\PDO::ATTR_CASE) === \PDO::CASE_LOWER) {
                 $column = array_change_key_case($column, CASE_UPPER);
             }
             $c = $this->createColumn($column);
+            if (isset($autoIncrementColumnsSet[$c->name])) {
+                $c->autoIncrement = true;
+            }
             $table->columns[$c->name] = $c;
         }
 
         return true;
+    }
+
+    /**
+     * 查找自增列
+     * https://eco.dameng.com/document/dm/zh-cn/faq/faq-sql-gramm#%E8%BE%BE%E6%A2%A6%E5%A6%82%E4%BD%95%E5%88%A4%E6%96%AD%E8%A1%A8%E4%B8%AD%E7%9A%84%E5%AD%97%E6%AE%B5%E6%98%AF%E5%90%A6%E4%B8%BA%E8%87%AA%E5%A2%9E%E5%88%97%EF%BC%9F%E5%A6%82%E4%BD%95%E7%94%A8%E8%84%9A%E6%9C%AC%E6%9F%A5%E8%AF%A2%EF%BC%9F
+     * @param TableSchema $table the table schema
+     * @return map[string]string columnSet
+     */
+    protected function findAutoIncrementColumns($table) {
+        $sql = <<<'SQL'
+SELECT
+	B.OWNER,
+	B.TABLE_NAME,
+	C.NAME COLUMN_NAME
+FROM
+	SYS.SYSOBJECTS A
+	INNER JOIN SYS.ALL_TABLES B ON B.TABLE_NAME = A.NAME
+	INNER JOIN SYS.SYSCOLUMNS C ON A.ID = C.ID
+WHERE
+	B.OWNER = :schemaName
+	AND B.TABLE_NAME = :tableName
+	AND C.INFO2 & 0x01 = 0x01
+SQL;
+        try {
+            $columns = $this->db->createCommand($sql, [
+                ':tableName' => $table->name,
+                ':schemaName' => $table->schemaName,
+            ])->queryAll();
+        } catch (\Exception $e) {
+            return [];
+        }
+        if (empty($columns)) {
+            return [];
+        }
+        $columnSet = [];
+        foreach ($columns as $column) {
+            $columnSet[$column['COLUMN_NAME']] = $column['COLUMN_NAME'];
+        }
+        return $columnSet;
     }
 
     /**
@@ -373,9 +416,10 @@ SQL;
 
     /**
      * @Overrides method in class 'Schema'
-     * @see https://www.php.net/manual/en/function.PDO-lastInsertId.php -> Oracle does not support this
-     *
-     * Returns the ID of the last inserted row or sequence value.
+     * @see https://eco.dameng.com/document/dm/zh-cn/pm/sql-appendix
+     * 返回插入到同一作用域中的 identity 列内的最后一个 identity 值。
+     * SELECT SCOPE_IDENTITY();
+     * SELECT @@IDENTITY;
      * @param string $sequenceName name of the sequence object (required by some DBMS)
      * @return string the row ID of the last row inserted, or the last value retrieved from the sequence object
      * @throws InvalidCallException if the DB connection is not active
@@ -384,9 +428,8 @@ SQL;
     {
         if ($this->db->isActive) {
             // get the last insert id from the master connection
-            $sequenceName = $this->quoteSimpleTableName($sequenceName);
-            return $this->db->useMaster(function (Connection $db) use ($sequenceName) {
-                return $db->createCommand("SELECT {$sequenceName}.CURRVAL FROM DUAL")->queryScalar();
+            return $this->db->useMaster(function (Connection $db) {
+                return $db->createCommand("SELECT SCOPE_IDENTITY()")->queryScalar();
             });
         } else {
             throw new InvalidCallException('DB Connection is not active.');
@@ -569,8 +612,12 @@ SQL;
             } else {
                 $column->type = 'integer';
             }
-        } elseif (strpos($dbType, 'INTEGER') !== false) {
-            $column->type = 'integer';
+        } elseif ($dbType == 'INT') { // TINYINT INT BIGINT
+            $column->type = self::TYPE_INTEGER;
+        } elseif ($dbType == 'TINYINT') {
+            $column->type = self::TYPE_TINYINT;
+        } elseif ($dbType == 'BIGINT') {
+            $column->type = self::TYPE_BIGINT;
         } elseif (strpos($dbType, 'BLOB') !== false) {
             $column->type = 'binary';
         } elseif (strpos($dbType, 'CLOB') !== false) {
@@ -600,54 +647,74 @@ SQL;
         $column->scale = trim((string) $scale) === '' ? null : (int) $scale;
     }
 
-    /**
-     * {@inheritdoc}
-     */
     public function insert($table, $columns)
     {
-        $params = [];
-        $returnParams = [];
-        $sql = $this->db->getQueryBuilder()->insert($table, $columns, $params);
-        $tableSchema = $this->getTableSchema($table);
-        $returnColumns = $tableSchema->primaryKey;
-        if (!empty($returnColumns)) {
-            $columnSchemas = $tableSchema->columns;
-            $returning = [];
-            foreach ((array) $returnColumns as $name) {
-                $phName = QueryBuilder::PARAM_PREFIX . (count($params) + count($returnParams));
-                $returnParams[$phName] = [
-                    'column' => $name,
-                    'value' => '',
-                ];
-                if (!isset($columnSchemas[$name]) || $columnSchemas[$name]->phpType !== 'integer') {
-                    $returnParams[$phName]['dataType'] = \PDO::PARAM_STR;
-                } else {
-                    $returnParams[$phName]['dataType'] = \PDO::PARAM_INT;
-                }
-                $returnParams[$phName]['size'] = isset($columnSchemas[$name]->size) ? $columnSchemas[$name]->size : -1;
-                $returning[] = $this->quoteColumnName($name);
-            }
-            $sql .= ' RETURNING ' . implode(', ', $returning) . ' INTO ' . implode(', ', array_keys($returnParams));
-        }
-
-        $command = $this->db->createCommand($sql, $params);
-        $command->prepare(false);
-
-        foreach ($returnParams as $name => &$value) {
-            $command->pdoStatement->bindParam($name, $value['value'], $value['dataType'], $value['size']);
-        }
-
+        $command = $this->db->createCommand()->insert($table, $columns);
         if (!$command->execute()) {
             return false;
         }
-
+        $tableSchema = $this->getTableSchema($table);
         $result = [];
-        foreach ($returnParams as $value) {
-            $result[$value['column']] = $value['value'];
+        foreach ($tableSchema->primaryKey as $name) {
+            if ($tableSchema->columns[$name]->autoIncrement) {
+                $result[$name] = $this->getLastInsertID($tableSchema->sequenceName);
+                break;
+            }
+
+            $result[$name] = isset($columns[$name]) ? $columns[$name] : $tableSchema->columns[$name]->defaultValue;
         }
 
         return $result;
     }
+
+    /**
+     * {@inheritdoc}
+     */
+    // public function insert($table, $columns)
+    // {
+    //     $params = [];
+    //     $returnParams = [];
+    //     $sql = $this->db->getQueryBuilder()->insert($table, $columns, $params);
+    //     $tableSchema = $this->getTableSchema($table);
+    //     $returnColumns = $tableSchema->primaryKey;
+    //     if (!empty($returnColumns)) {
+    //         $columnSchemas = $tableSchema->columns;
+    //         $returning = [];
+    //         foreach ((array) $returnColumns as $name) {
+    //             $phName = QueryBuilder::PARAM_PREFIX . (count($params) + count($returnParams));
+    //             $returnParams[$phName] = [
+    //                 'column' => $name,
+    //                 'value' => '',
+    //             ];
+    //             if (!isset($columnSchemas[$name]) || $columnSchemas[$name]->phpType !== 'integer') {
+    //                 $returnParams[$phName]['dataType'] = \PDO::PARAM_STR;
+    //             } else {
+    //                 $returnParams[$phName]['dataType'] = \PDO::PARAM_INT;
+    //             }
+    //             $returnParams[$phName]['size'] = isset($columnSchemas[$name]->size) ? $columnSchemas[$name]->size : -1;
+    //             $returning[] = $this->quoteColumnName($name);
+    //         }
+    //         $sql .= ' RETURNING ' . implode(', ', $returning) . ' INTO ' . implode(', ', array_keys($returnParams));
+    //     }
+
+    //     $command = $this->db->createCommand($sql, $params);
+    //     $command->prepare(false);
+
+    //     foreach ($returnParams as $name => &$value) {
+    //         $command->pdoStatement->bindParam($name, $value['value'], $value['dataType'], $value['size']);
+    //     }
+
+    //     if (!$command->execute()) {
+    //         return false;
+    //     }
+
+    //     $result = [];
+    //     foreach ($returnParams as $value) {
+    //         $result[$value['column']] = $value['value'];
+    //     }
+
+    //     return $result;
+    // }
 
     /**
      * Loads multiple types of constraints and returns the specified ones.

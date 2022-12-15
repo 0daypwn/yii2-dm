@@ -64,37 +64,6 @@ class QueryBuilder extends \yii\db\QueryBuilder
     }
 
     /**
-     * {@inheritdoc}
-     */
-    public function buildOrderByAndLimit($sql, $orderBy, $limit, $offset)
-    {
-        $orderBy = $this->buildOrderBy($orderBy);
-        if ($orderBy !== '') {
-            $sql .= $this->separator . $orderBy;
-        }
-
-        $filters = [];
-        if ($this->hasOffset($offset)) {
-            $filters[] = 'rowNumId > ' . $offset;
-        }
-        if ($this->hasLimit($limit)) {
-            $filters[] = 'rownum <= ' . $limit;
-        }
-        if (empty($filters)) {
-            return $sql;
-        }
-
-        $filter = implode(' AND ', $filters);
-        return <<<EOD
-WITH USER_SQL AS ($sql),
-    PAGINATION AS (SELECT USER_SQL.*, rownum as rowNumId FROM USER_SQL)
-SELECT *
-FROM PAGINATION
-WHERE $filter
-EOD;
-    }
-
-    /**
      * Builds a SQL statement for renaming a DB table.
      *
      * @param string $table the table to be renamed. The name will be properly quoted by the method.
