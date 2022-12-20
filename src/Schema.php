@@ -55,12 +55,40 @@ class Schema extends \yii\db\Schema implements ConstraintFinderInterface
     public function init()
     {
         parent::init();
+        $this->resolveDSNDefaultSchema();
         if ($this->defaultSchema === null) {
             $username = $this->db->username;
             if (empty($username)) {
                 $username = isset($this->db->masters[0]['username']) ? $this->db->masters[0]['username'] : '';
             }
             $this->defaultSchema = strtoupper($username);
+        }
+        // 与 mysql use database 类似;
+        if ($this->defaultSchema !== null) {
+            $this->db->createCommand('SET SCHEMA ' . $this->defaultSchema)->execute();
+        }
+    }
+
+    /**
+     * 设置 defaultSchema
+     * 兼容 mysql dsn写法 dbname
+     * dm:host=127.0.0.1:5236;dbname=test
+     */
+    protected function resolveDSNDefaultSchema()
+    {
+        if (strpos($this->db->dsn, 'dbname', 0) == false) {
+            return;
+        }
+        $str = substr($this->db->dsn, strlen($this->db->getDriverName() . ":"));
+        $parts = explode(';', $str);
+        foreach($parts as $part) {
+            if (strpos($part, 'dbname', 0) === false) {
+                continue;
+            }
+            $kv = explode('=', $part);
+            if (isset($kv[1])) {
+                $this->defaultSchema = trim($kv[1]);
+            }
         }
     }
 
